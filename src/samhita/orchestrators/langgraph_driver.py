@@ -12,8 +12,10 @@ driver implementations.
 
 from __future__ import annotations
 
+import asyncio
 import time
-from typing import Any, TypedDict
+from collections.abc import Awaitable, Callable
+from typing import Any, TypeVar, TypedDict
 
 from samhita.core.bootstrap import bootstrap_llm_providers, bootstrap_tools
 from samhita.core.fetchers import (
@@ -187,52 +189,40 @@ async def _fetch_node(state: _GraphState) -> _GraphState:
     structured_entities: list[Entity] = list(state.get("structured_entities", []))
     structured_edges: list[Edge] = list(state.get("structured_edges", []))
 
-    # --- PubMed / PMC literature --------------------------------------------
-    if SourceName.PUBMED_CENTRAL in spec.sources or SourceName.PUBMED_ABSTRACTS in spec.sources:
-        query = _build_pubmed_query(spec)
-        search_tool = get_tool("search_pubmed")
-        abstract_tool = get_tool("fetch_pubmed_abstract")
-        pmc_tool = get_tool("fetch_pmc_paper")
+    literature_requested = (
+        SourceName.PUBMED_CENTRAL in spec.sources
+        or SourceName.PUBMED_ABSTRACTS in spec.sources
+    )
 
-        search_out = await search_tool.func(
+    if literature_requested:
+        query = _build_pubmed_query(spec)
+        search_out = await get_tool("search_pubmed").func(
             PubMedSearchInput(query=query, max_results=min(spec.max_papers, 50))
         )
         pmids = getattr(search_out, "pmids", []) or []
 
-        for pmid in pmids:
-            abstract_out = await abstract_tool.func(PubMedAbstractInput(pmid=pmid))
-            pmc_id = getattr(abstract_out, "pmc_id", None)
-            sections: dict[str, str] = {}
-            title = getattr(abstract_out, "title", "")
-
-            if pmc_id and SourceName.PUBMED_CENTRAL in spec.sources:
-                pmc_out = await pmc_tool.func(PMCFetchInput(pmc_id=pmc_id))
-                if isinstance(pmc_out, PMCFetchOutput) and not pmc_out.error:
-                    sections = dict(pmc_out.sections)
-                    title = pmc_out.title or title
-
-            if not sections:
-                sections = {SectionType.ABSTRACT.value: getattr(abstract_out, "abstract", "")}
-
-            papers.append(
-                {
-                    "source_type": SourceType.PMC if pmc_id else SourceType.PUBMED,
-                    "source_id": f"PMC:{pmc_id}" if pmc_id else f"PMID:{pmid}",
-                    "title": title,
-                    "sections": sections,
-                }
-            )
+        include_pmc = SourceName.PUBMED_CENTRAL in spec.sources
+        fetched_papers = await _bounded_gather(
+            [_fetch_one_paper(pmid, include_pmc) for pmid in pmids],
+            limit=_NCBI_CONCURRENCY,
+        )
+        papers.extend(p for p in fetched_papers if p is not None)
 
     # Structured sources ship canonical IDs, so their output bypasses
     # extract + normalize and flows directly as Entity / Edge.
-    for source, fetcher in _STRUCTURED_FETCHERS.items():
-        if source not in spec.sources:
+    structured_results = await _bounded_gather(
+        [
+            _run_structured_fetcher(source, fetcher, spec)
+            for source, fetcher in _STRUCTURED_FETCHERS.items()
+            if source in spec.sources
+        ],
+        limit=len(_STRUCTURED_FETCHERS),
+    )
+    for source, result in structured_results:
+        if isinstance(result, Exception):
+            run_state.errors.append(f"fetch_{source.value}: {result}")
             continue
-        try:
-            ents, eds = await fetcher(spec)
-        except Exception as exc:  # noqa: BLE001
-            run_state.errors.append(f"fetch_{source.value}: {exc}")
-            continue
+        ents, eds = result
         structured_entities.extend(ents)
         structured_edges.extend(eds)
 
@@ -241,6 +231,43 @@ async def _fetch_node(state: _GraphState) -> _GraphState:
     state["structured_edges"] = structured_edges
     run_state.fetched_documents = len(papers) + len(structured_entities)
     return state
+
+
+async def _fetch_one_paper(pmid: str, include_pmc: bool) -> dict[str, Any] | None:
+    """Abstract (+ optional PMC full-text) for a single PMID."""
+    abstract_out = await get_tool("fetch_pubmed_abstract").func(
+        PubMedAbstractInput(pmid=pmid)
+    )
+    pmc_id = getattr(abstract_out, "pmc_id", None)
+    title = getattr(abstract_out, "title", "")
+    sections: dict[str, str] = {}
+
+    if pmc_id and include_pmc:
+        pmc_out = await get_tool("fetch_pmc_paper").func(PMCFetchInput(pmc_id=pmc_id))
+        if isinstance(pmc_out, PMCFetchOutput) and not pmc_out.error:
+            sections = dict(pmc_out.sections)
+            title = pmc_out.title or title
+
+    if not sections:
+        sections = {SectionType.ABSTRACT.value: getattr(abstract_out, "abstract", "")}
+
+    return {
+        "source_type": SourceType.PMC if pmc_id else SourceType.PUBMED,
+        "source_id": f"PMC:{pmc_id}" if pmc_id else f"PMID:{pmid}",
+        "title": title,
+        "sections": sections,
+    }
+
+
+async def _run_structured_fetcher(
+    source: SourceName,
+    fetcher: Callable[[KGSpec], Awaitable[tuple[list[Entity], list[Edge]]]],
+    spec: KGSpec,
+) -> tuple[SourceName, tuple[list[Entity], list[Edge]] | Exception]:
+    try:
+        return source, await fetcher(spec)
+    except Exception as exc:  # noqa: BLE001
+        return source, exc
 
 
 _STRUCTURED_FETCHERS: dict[SourceName, Any] = {
@@ -258,56 +285,81 @@ async def _extract_node(state: _GraphState) -> _GraphState:
     raw_entities: list[tuple[ExtractionCandidate, Provenance]] = []
     raw_edges: list[tuple[ExtractedEdge, Provenance]] = []
 
+    # Collect every (paper, section) as an independent extraction job.
+    jobs: list[tuple[dict[str, Any], str, str, ExtractFromTextInput]] = []
     for paper in state.get("fetched_papers", []):
         source_id = paper["source_id"]
-        source_type = paper["source_type"]
         sections: dict[str, str] = paper.get("sections", {})
-
         for section_name, text in sections.items():
             if not text or not text.strip():
                 continue
-
             section_enum = SectionType.from_alias(section_name)
-            payload = ExtractFromTextInput(
-                text=text,
-                section=section_enum,
-                entity_vocabulary=spec.entity_types,
-                relation_vocabulary=spec.relation_types,
-                source_id=source_id,
-                cache_hint=f"{spec.recipe.value}:{section_enum.value}",
+            jobs.append(
+                (
+                    paper,
+                    source_id,
+                    section_name,
+                    ExtractFromTextInput(
+                        text=text,
+                        section=section_enum,
+                        entity_vocabulary=spec.entity_types,
+                        relation_vocabulary=spec.relation_types,
+                        source_id=source_id,
+                        cache_hint=f"{spec.recipe.value}:{section_enum.value}",
+                    ),
+                )
             )
-            out = await extract_tool.func(payload)
-            if not isinstance(out, ExtractFromTextOutput):
-                continue
 
-            run_state.total_cost_usd += out.cost_usd
-            if out.error:
-                run_state.errors.append(f"extract:{source_id}:{section_name}: {out.error}")
-                continue
+    async def _run_job(job: tuple[dict[str, Any], str, str, ExtractFromTextInput]):
+        _, _, _, payload = job
+        return job, await extract_tool.func(payload)
 
-            for ent in out.entities:
-                prov = Provenance(
-                    source_id=source_id,
-                    source_type=source_type,
-                    extracting_model=out.model_used,
-                    model_tier=out.model_tier,
-                    section=section_enum,
-                    evidence_span=ent.evidence_span,
-                    cost_usd=0.0,
+    results = await _bounded_gather(
+        [_run_job(j) for j in jobs], limit=_LLM_CONCURRENCY
+    )
+
+    for (paper, source_id, section_name, payload), out in results:
+        source_type = paper["source_type"]
+        section_enum = payload.section
+        if not isinstance(out, ExtractFromTextOutput):
+            continue
+
+        run_state.total_cost_usd += out.cost_usd
+        if out.error:
+            run_state.errors.append(f"extract:{source_id}:{section_name}: {out.error}")
+            continue
+
+        for ent in out.entities:
+            raw_entities.append(
+                (
+                    ent,
+                    Provenance(
+                        source_id=source_id,
+                        source_type=source_type,
+                        extracting_model=out.model_used,
+                        model_tier=out.model_tier,
+                        section=section_enum,
+                        evidence_span=ent.evidence_span,
+                        cost_usd=0.0,
+                    ),
                 )
-                raw_entities.append((ent, prov))
+            )
 
-            for edge in out.edges:
-                prov = Provenance(
-                    source_id=source_id,
-                    source_type=source_type,
-                    extracting_model=out.model_used,
-                    model_tier=out.model_tier,
-                    section=section_enum,
-                    evidence_span=edge.evidence_span,
-                    cost_usd=0.0,
+        for edge in out.edges:
+            raw_edges.append(
+                (
+                    edge,
+                    Provenance(
+                        source_id=source_id,
+                        source_type=source_type,
+                        extracting_model=out.model_used,
+                        model_tier=out.model_tier,
+                        section=section_enum,
+                        evidence_span=edge.evidence_span,
+                        cost_usd=0.0,
+                    ),
                 )
-                raw_edges.append((edge, prov))
+            )
 
     state["raw_entities"] = raw_entities
     state["raw_edges"] = raw_edges
@@ -328,26 +380,41 @@ async def _normalize_node(state: _GraphState) -> _GraphState:
         unique.setdefault((edge.subject.name.lower(), edge.subject.entity_type), edge.subject)
         unique.setdefault((edge.object.name.lower(), edge.object.entity_type), edge.object)
 
-    normalized_by_key: dict[tuple[str, EntityType], Entity] = {}
-    for key, cand in unique.items():
-        out = await normalize_tool.func(
-            NormalizeEntityInput(name=cand.name, entity_type=cand.entity_type)
-        )
-        if not isinstance(out, NormalizeEntityOutput) or out.primary_id is None:
-            # Synthetic local: ID keeps the entity flowing; callers can prune.
-            primary = Identifier(namespace=NamespaceName.LOCAL, value=slugify(cand.name))
-            run_state.errors.append(
-                f"normalize:{cand.name}:{cand.entity_type.value}: "
-                f"{(out.error if isinstance(out, NormalizeEntityOutput) else 'unknown')}"
+    async def _normalize_one(cand: ExtractionCandidate) -> NormalizeEntityOutput | None:
+        try:
+            return await normalize_tool.func(
+                NormalizeEntityInput(name=cand.name, entity_type=cand.entity_type)
             )
+        except Exception as exc:  # noqa: BLE001
+            run_state.errors.append(
+                f"normalize:{cand.name}:{cand.entity_type.value}: {exc}"
+            )
+            return None
+
+    candidates = list(unique.items())
+    results = await _bounded_gather(
+        [_normalize_one(cand) for _, cand in candidates],
+        limit=_NORMALIZE_CONCURRENCY,
+    )
+
+    normalized_by_key: dict[tuple[str, EntityType], Entity] = {}
+    for (key, cand), out in zip(candidates, results, strict=True):
+        if not isinstance(out, NormalizeEntityOutput) or out.primary_id is None:
+            primary = Identifier(namespace=NamespaceName.LOCAL, value=slugify(cand.name))
+            reason = out.error if isinstance(out, NormalizeEntityOutput) else "unknown"
+            run_state.errors.append(
+                f"normalize:{cand.name}:{cand.entity_type.value}: {reason}"
+            )
+            aliases: list[Identifier] = []
         else:
             primary = out.primary_id
+            aliases = out.aliases
 
         normalized_by_key[key] = Entity(
             entity_type=cand.entity_type,
             name=cand.name,
             primary_id=primary,
-            aliases=getattr(out, "aliases", []) if isinstance(out, NormalizeEntityOutput) else [],
+            aliases=aliases,
         )
 
     # Flatten to name -> Entity (first occurrence wins)
@@ -462,6 +529,33 @@ async def _write_node(state: _GraphState) -> _GraphState:
 # =============================================================================
 # Helpers
 # =============================================================================
+
+
+# Concurrency bounds chosen to respect upstream rate limits while still
+# giving a meaningful speedup. Override via env vars if these turn out to
+# be too aggressive for any specific provider.
+_NCBI_CONCURRENCY = 5      # NCBI E-utilities: 3 req/s unkeyed, 10 keyed
+_LLM_CONCURRENCY = 5       # Anthropic default per-minute caps
+_NORMALIZE_CONCURRENCY = 8  # mygene / OLS / ChEMBL — well below their rate caps
+
+_T = TypeVar("_T")
+
+
+async def _bounded_gather(
+    awaitables: list[Awaitable[_T]],
+    *,
+    limit: int,
+) -> list[_T]:
+    """Await every coroutine with an asyncio.Semaphore-bounded concurrency limit."""
+    if not awaitables:
+        return []
+    sem = asyncio.Semaphore(max(1, limit))
+
+    async def _run(aw: Awaitable[_T]) -> _T:
+        async with sem:
+            return await aw
+
+    return await asyncio.gather(*(_run(aw) for aw in awaitables))
 
 
 class _LinearFallbackGraph:
