@@ -16,6 +16,11 @@ import time
 from typing import Any, TypedDict
 
 from samhita.core.bootstrap import bootstrap_llm_providers, bootstrap_tools
+from samhita.core.fetchers import (
+    fetch_chembl_for_spec,
+    fetch_drugbank_for_spec,
+    fetch_opentargets_for_spec,
+)
 from samhita.core.llm import LLMClient, Message
 from samhita.core.llm_clients import get_llm_client
 from samhita.core.prompts import PLANNER_SYSTEM_PROMPT
@@ -62,6 +67,10 @@ class _GraphState(TypedDict, total=False):
     fetched_papers: list[dict[str, Any]]
     raw_entities: list[tuple[ExtractionCandidate, Provenance]]
     raw_edges: list[tuple[ExtractedEdge, Provenance]]
+    # Structured sources (OpenTargets / ChEMBL / DrugBank) produce
+    # canonical Entity / Edge directly, bypassing extract + normalize.
+    structured_entities: list[Entity]
+    structured_edges: list[Edge]
     normalized_entities: dict[str, Entity]  # name -> Entity
     final_edges: list[Edge]
     started_at: float
@@ -110,6 +119,8 @@ class LangGraphOrchestrator(AgentOrchestrator):
             "fetched_papers": [],
             "raw_entities": [],
             "raw_edges": [],
+            "structured_entities": [],
+            "structured_edges": [],
             "normalized_entities": {},
             "final_edges": [],
             "started_at": time.monotonic(),
@@ -171,6 +182,8 @@ async def _fetch_node(state: _GraphState) -> _GraphState:
     spec: KGSpec = state["spec"]
     run_state: RunState = state["run_state"]
     papers: list[dict[str, Any]] = []
+    structured_entities: list[Entity] = list(state.get("structured_entities", []))
+    structured_edges: list[Edge] = list(state.get("structured_edges", []))
 
     # --- PubMed / PMC literature --------------------------------------------
     if SourceName.PUBMED_CENTRAL in spec.sources or SourceName.PUBMED_ABSTRACTS in spec.sources:
@@ -197,7 +210,6 @@ async def _fetch_node(state: _GraphState) -> _GraphState:
                     title = pmc_out.title or title
 
             if not sections:
-                # Fallback: abstract-only paper
                 sections = {SectionType.ABSTRACT.value: getattr(abstract_out, "abstract", "")}
 
             papers.append(
@@ -209,14 +221,39 @@ async def _fetch_node(state: _GraphState) -> _GraphState:
                 }
             )
 
-    # --- Structured sources (skeleton) --------------------------------------
-    # OpenTargets / ChEMBL / DrugBank feed structured records rather than
-    # free text. Section-aware extraction doesn't apply to them directly,
-    # so v1 hooks them in as JSON blobs tagged as the 'results' section.
-    # Real recipe-specific queries land in a future iteration.
+    # --- Structured sources (bypass extract + normalize) ---------------------
+    # OpenTargets / ChEMBL / DrugBank already ship canonical IDs. Their
+    # output flows as Entity / Edge directly; the extractor and normalizer
+    # only process literature-derived text.
+
+    if SourceName.OPENTARGETS in spec.sources:
+        try:
+            ents, eds = await fetch_opentargets_for_spec(spec)
+            structured_entities.extend(ents)
+            structured_edges.extend(eds)
+        except Exception as exc:  # noqa: BLE001
+            run_state.errors.append(f"fetch_opentargets: {exc}")
+
+    if SourceName.CHEMBL in spec.sources:
+        try:
+            ents, eds = await fetch_chembl_for_spec(spec)
+            structured_entities.extend(ents)
+            structured_edges.extend(eds)
+        except Exception as exc:  # noqa: BLE001
+            run_state.errors.append(f"fetch_chembl: {exc}")
+
+    if SourceName.DRUGBANK in spec.sources:
+        try:
+            ents, eds = await fetch_drugbank_for_spec(spec)
+            structured_entities.extend(ents)
+            structured_edges.extend(eds)
+        except Exception as exc:  # noqa: BLE001
+            run_state.errors.append(f"fetch_drugbank: {exc}")
 
     state["fetched_papers"] = papers
-    run_state.fetched_documents = len(papers)
+    state["structured_entities"] = structured_entities
+    state["structured_edges"] = structured_edges
+    run_state.fetched_documents = len(papers) + len(structured_entities)
     return state
 
 
@@ -326,6 +363,12 @@ async def _normalize_node(state: _GraphState) -> _GraphState:
     for (name_lower, _), entity in normalized_by_key.items():
         normalized.setdefault(name_lower, entity)
 
+    # Structured sources already ship canonical Entity instances — merge them
+    # in without re-normalizing. Literature-derived names take precedence on
+    # collision, since they reflect what the model actually found.
+    for entity in state.get("structured_entities", []):
+        normalized.setdefault(entity.name.lower(), entity)
+
     state["normalized_entities"] = normalized
     run_state.normalized_entities = len(normalized)
     return state
@@ -369,6 +412,29 @@ async def _flag_conflicts_node(state: _GraphState) -> _GraphState:
 
         seen[key] = edge
         final_edges.append(edge)
+
+    # Append structured edges verbatim — they already carry provenance and
+    # canonical IDs. Reverse-direction conflict check runs against them too.
+    for structured_edge in state.get("structured_edges", []):
+        key = (
+            structured_edge.subject_id,
+            structured_edge.relation,
+            structured_edge.object_id,
+        )
+        reverse_key = (
+            structured_edge.object_id,
+            structured_edge.relation,
+            structured_edge.subject_id,
+        )
+        if reverse_key in seen:
+            structured_edge.conflict_flag = True
+            structured_edge.dissenting_sources.append(
+                seen[reverse_key].provenance.source_id
+            )
+            run_state.flagged_conflicts += 1
+        if key not in seen:
+            seen[key] = structured_edge
+            final_edges.append(structured_edge)
 
     state["final_edges"] = final_edges
     return state
