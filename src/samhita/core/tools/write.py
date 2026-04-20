@@ -17,7 +17,7 @@ from typing import Any
 from pydantic import BaseModel, Field
 
 from samhita.core.schemas import Edge, Entity
-from samhita.core.tools import Tool, register_tool
+from samhita.core.tools import Tool, register_tools
 
 
 class BiocypherWriteInput(BaseModel):
@@ -216,20 +216,19 @@ def _write_via_csv(
 
 
 def register_write_tools() -> None:
-    from samhita.core.tools import all_tools
-
-    if "write_biocypher" in all_tools():
-        return
-    register_tool(
-        Tool(
-            name="write_biocypher",
-            description=(
-                "Write a set of entities and edges to disk via Biocypher "
-                "(preferred) or a CSV + schema.json fallback."
+    # Tools built per call so monkeypatched `write_biocypher` flows through.
+    register_tools(
+        [
+            Tool(
+                name="write_biocypher",
+                description=(
+                    "Write a set of entities and edges to disk via Biocypher "
+                    "(preferred) or a CSV + schema.json fallback."
+                ),
+                input_schema=BiocypherWriteInput,
+                output_schema=BiocypherWriteOutput,
+                func=write_biocypher,
+                tags=["write", "biocypher"],
             ),
-            input_schema=BiocypherWriteInput,
-            output_schema=BiocypherWriteOutput,
-            func=write_biocypher,
-            tags=["write", "biocypher"],
-        )
+        ]
     )

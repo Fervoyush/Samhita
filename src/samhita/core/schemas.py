@@ -6,11 +6,14 @@ Agent Zero, custom) serialize to/from them but must not mutate them.
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 from enum import Enum
-from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
+
+
+def _now() -> datetime:
+    return datetime.now(timezone.utc)
 
 
 class EntityType(str, Enum):
@@ -52,6 +55,30 @@ class SectionType(str, Enum):
     DISCUSSION = "discussion"
     UNKNOWN = "unknown"
 
+    @classmethod
+    def from_alias(cls, name: str) -> "SectionType":
+        """Map a PMCGrab section label (or alias) to a SectionType."""
+        key = (name or "").strip().lower()
+        return _SECTION_ALIASES.get(key, cls.UNKNOWN)
+
+
+_SECTION_ALIASES: dict[str, SectionType] = {
+    "abstract": SectionType.ABSTRACT,
+    "introduction": SectionType.INTRODUCTION,
+    "intro": SectionType.INTRODUCTION,
+    "background": SectionType.INTRODUCTION,
+    "methods": SectionType.METHODS,
+    "method": SectionType.METHODS,
+    "materials and methods": SectionType.METHODS,
+    "methodology": SectionType.METHODS,
+    "results": SectionType.RESULTS,
+    "result": SectionType.RESULTS,
+    "findings": SectionType.RESULTS,
+    "discussion": SectionType.DISCUSSION,
+    "conclusion": SectionType.DISCUSSION,
+    "conclusions": SectionType.DISCUSSION,
+}
+
 
 class ModelTier(str, Enum):
     """Which tier of model produced an output (for cost telemetry)."""
@@ -88,6 +115,41 @@ class RecipeName(str, Enum):
     DISEASE_GENE_PATHWAY = "disease_gene_pathway"
 
 
+class NamespaceName(str, Enum):
+    """Canonical identifier namespaces used across Samhita.
+
+    Using an enum here turns namespace typos (e.g. ``"Chembl"`` vs
+    ``"ChEMBL"``) into import-time errors instead of silent ID mismatches.
+    Because this is a ``str, Enum``, members pass Pydantic validation
+    anywhere ``namespace: str`` is expected.
+    """
+
+    HGNC = "HGNC"
+    NCBI_GENE = "NCBIGene"
+    ENSEMBL = "Ensembl"
+    UNIPROT = "UniProt"
+    CHEMBL = "ChEMBL"
+    DRUGBANK = "DrugBank"
+    MONDO = "MONDO"
+    EFO = "EFO"
+    HP = "HP"
+    DOID = "DOID"
+    REACTOME = "Reactome"
+    KEGG = "KEGG"
+    CL = "CL"
+    UBERON = "UBERON"
+    LOCAL = "local"
+
+
+class RunStatus(str, Enum):
+    """Lifecycle status for a single Samhita build run."""
+
+    PENDING = "pending"
+    RUNNING = "running"
+    COMPLETED = "completed"
+    FAILED = "failed"
+
+
 class Identifier(BaseModel):
     """A namespace-qualified identifier for a biomedical entity."""
 
@@ -115,7 +177,7 @@ class Provenance(BaseModel):
         default=None,
         description="verbatim text snippet supporting the claim (for audit)",
     )
-    extracted_at: datetime = Field(default_factory=datetime.utcnow)
+    extracted_at: datetime = Field(default_factory=_now)
     cost_usd: float = 0.0
     cache_hit: bool = False
 
@@ -189,7 +251,11 @@ class RunState(BaseModel):
     total_cost_usd: float = 0.0
     cache_hit_rate: float = 0.0
     errors: list[str] = Field(default_factory=list)
-    status: Literal["pending", "running", "completed", "failed"] = "pending"
+    status: RunStatus = RunStatus.PENDING
+    output_path: str | None = Field(
+        default=None,
+        description="filesystem path of the written KG artifact (set by the write node)",
+    )
 
 
 class KGResult(BaseModel):
@@ -202,7 +268,7 @@ class KGResult(BaseModel):
     biocypher_output_path: str | None = None
     neo4j_uri: str | None = None
     build_duration_seconds: float = 0.0
-    completed_at: datetime = Field(default_factory=datetime.utcnow)
+    completed_at: datetime = Field(default_factory=_now)
 
     @property
     def edge_count(self) -> int:

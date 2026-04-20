@@ -18,7 +18,7 @@ from samhita.core.schemas import (
     RelationType,
     SectionType,
 )
-from samhita.core.tools import Tool, all_tools, register_tool
+from samhita.core.tools import Tool, register_tool
 
 
 # ---------------------------------------------------------------------------
@@ -178,7 +178,5 @@ def make_extract_from_text_tool(llm: LLMClient) -> Tool:
 
 
 def register_extract_tools(llm: LLMClient) -> None:
-    """Register the LLM-bound extraction tool if not already registered."""
-    if "extract_from_text" in all_tools():
-        return
+    """Register the LLM-bound extraction tool (idempotent)."""
     register_tool(make_extract_from_text_tool(llm))

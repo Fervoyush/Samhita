@@ -15,7 +15,7 @@ from typing import Any
 import httpx
 from pydantic import BaseModel, Field
 
-from samhita.core.tools import Tool, register_tool
+from samhita.core.tools import Tool, register_tools
 
 # ---------------------------------------------------------------------------
 # Shared HTTP defaults
@@ -402,66 +402,58 @@ async def lookup_drugbank(payload: DrugBankLookupInput) -> DrugBankLookupOutput:
 
 
 def register_fetch_tools() -> None:
-    """Register every fetch tool in the central registry.
-
-    Called by :func:`samhita.core.bootstrap.bootstrap_tools`. Idempotent —
-    safe to call multiple times (silently skips already-registered tools).
-    """
-    tools: list[Tool] = [
-        Tool(
-            name="fetch_pmc_paper",
-            description="Fetch a PubMed Central paper's section-aware text via PMCGrab.",
-            input_schema=PMCFetchInput,
-            output_schema=PMCFetchOutput,
-            func=fetch_pmc_paper,
-            tags=["fetch", "pmc", "fulltext"],
-        ),
-        Tool(
-            name="search_pubmed",
-            description="Search PubMed and return a list of PMIDs for a given query.",
-            input_schema=PubMedSearchInput,
-            output_schema=PubMedSearchOutput,
-            func=search_pubmed,
-            tags=["fetch", "pubmed", "search"],
-        ),
-        Tool(
-            name="fetch_pubmed_abstract",
-            description="Fetch a single PubMed abstract + metadata by PMID.",
-            input_schema=PubMedAbstractInput,
-            output_schema=PubMedAbstractOutput,
-            func=fetch_pubmed_abstract,
-            tags=["fetch", "pubmed", "abstract"],
-        ),
-        Tool(
-            name="query_opentargets",
-            description="POST a GraphQL query to the OpenTargets Platform API.",
-            input_schema=OpenTargetsQueryInput,
-            output_schema=OpenTargetsQueryOutput,
-            func=query_opentargets,
-            tags=["fetch", "opentargets", "structured"],
-        ),
-        Tool(
-            name="query_chembl",
-            description="GET a ChEMBL REST endpoint (e.g. 'molecule', 'target').",
-            input_schema=ChEMBLQueryInput,
-            output_schema=ChEMBLQueryOutput,
-            func=query_chembl,
-            tags=["fetch", "chembl", "structured"],
-        ),
-        Tool(
-            name="lookup_drugbank",
-            description="Lookup a drug in a user-provided DrugBank JSON dump.",
-            input_schema=DrugBankLookupInput,
-            output_schema=DrugBankLookupOutput,
-            func=lookup_drugbank,
-            tags=["fetch", "drugbank", "structured"],
-        ),
-    ]
-
-    from samhita.core.tools import all_tools
-
-    existing = all_tools()
-    for tool in tools:
-        if tool.name in existing:
-            continue
-        register_tool(tool)
+    # Tool objects are constructed per call so monkeypatched module
+    # attributes (e.g. `search_pubmed`) are picked up in tests that
+    # re-bootstrap after patching.
+    register_tools(
+        [
+            Tool(
+                name="fetch_pmc_paper",
+                description="Fetch a PubMed Central paper's section-aware text via PMCGrab.",
+                input_schema=PMCFetchInput,
+                output_schema=PMCFetchOutput,
+                func=fetch_pmc_paper,
+                tags=["fetch", "pmc", "fulltext"],
+            ),
+            Tool(
+                name="search_pubmed",
+                description="Search PubMed and return a list of PMIDs for a given query.",
+                input_schema=PubMedSearchInput,
+                output_schema=PubMedSearchOutput,
+                func=search_pubmed,
+                tags=["fetch", "pubmed", "search"],
+            ),
+            Tool(
+                name="fetch_pubmed_abstract",
+                description="Fetch a single PubMed abstract + metadata by PMID.",
+                input_schema=PubMedAbstractInput,
+                output_schema=PubMedAbstractOutput,
+                func=fetch_pubmed_abstract,
+                tags=["fetch", "pubmed", "abstract"],
+            ),
+            Tool(
+                name="query_opentargets",
+                description="POST a GraphQL query to the OpenTargets Platform API.",
+                input_schema=OpenTargetsQueryInput,
+                output_schema=OpenTargetsQueryOutput,
+                func=query_opentargets,
+                tags=["fetch", "opentargets", "structured"],
+            ),
+            Tool(
+                name="query_chembl",
+                description="GET a ChEMBL REST endpoint (e.g. 'molecule', 'target').",
+                input_schema=ChEMBLQueryInput,
+                output_schema=ChEMBLQueryOutput,
+                func=query_chembl,
+                tags=["fetch", "chembl", "structured"],
+            ),
+            Tool(
+                name="lookup_drugbank",
+                description="Lookup a drug in a user-provided DrugBank JSON dump.",
+                input_schema=DrugBankLookupInput,
+                output_schema=DrugBankLookupOutput,
+                func=lookup_drugbank,
+                tags=["fetch", "drugbank", "structured"],
+            ),
+        ]
+    )

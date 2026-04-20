@@ -13,7 +13,7 @@ import httpx
 from pydantic import BaseModel, Field
 
 from samhita.core.schemas import EntityType, Identifier
-from samhita.core.tools import Tool, register_tool
+from samhita.core.tools import Tool, register_tools
 
 _DEFAULT_TIMEOUT = httpx.Timeout(20.0, connect=5.0)
 _DEFAULT_HEADERS = {
@@ -294,48 +294,43 @@ async def normalize_entity(payload: NormalizeEntityInput) -> NormalizeEntityOutp
 
 
 def register_normalize_tools() -> None:
-    tools: list[Tool] = [
-        Tool(
-            name="normalize_entity",
-            description=(
-                "Dispatch to the right normalizer (mygene for genes, OLS for "
-                "diseases/phenotypes/pathways, ChEMBL for drugs)."
+    # Tools built per call so monkeypatched module attributes flow through.
+    register_tools(
+        [
+            Tool(
+                name="normalize_entity",
+                description=(
+                    "Dispatch to the right normalizer (mygene for genes, OLS for "
+                    "diseases/phenotypes/pathways, ChEMBL for drugs)."
+                ),
+                input_schema=NormalizeEntityInput,
+                output_schema=NormalizeEntityOutput,
+                func=normalize_entity,
+                tags=["normalize"],
             ),
-            input_schema=NormalizeEntityInput,
-            output_schema=NormalizeEntityOutput,
-            func=normalize_entity,
-            tags=["normalize"],
-        ),
-        Tool(
-            name="normalize_gene",
-            description="Resolve a gene/protein name to HGNC/Entrez/Ensembl/UniProt IDs via mygene.info.",
-            input_schema=NormalizeEntityInput,
-            output_schema=NormalizeEntityOutput,
-            func=normalize_gene,
-            tags=["normalize", "gene"],
-        ),
-        Tool(
-            name="normalize_drug",
-            description="Resolve a drug name to a ChEMBL ID via the molecule/search endpoint.",
-            input_schema=NormalizeEntityInput,
-            output_schema=NormalizeEntityOutput,
-            func=normalize_drug,
-            tags=["normalize", "drug"],
-        ),
-        Tool(
-            name="normalize_via_ols",
-            description="Resolve disease/phenotype/pathway/cell/tissue terms via OLS4.",
-            input_schema=NormalizeEntityInput,
-            output_schema=NormalizeEntityOutput,
-            func=normalize_via_ols,
-            tags=["normalize", "ols"],
-        ),
-    ]
-
-    from samhita.core.tools import all_tools
-
-    existing = all_tools()
-    for tool in tools:
-        if tool.name in existing:
-            continue
-        register_tool(tool)
+            Tool(
+                name="normalize_gene",
+                description="Resolve a gene/protein name to HGNC/Entrez/Ensembl/UniProt IDs via mygene.info.",
+                input_schema=NormalizeEntityInput,
+                output_schema=NormalizeEntityOutput,
+                func=normalize_gene,
+                tags=["normalize", "gene"],
+            ),
+            Tool(
+                name="normalize_drug",
+                description="Resolve a drug name to a ChEMBL ID via the molecule/search endpoint.",
+                input_schema=NormalizeEntityInput,
+                output_schema=NormalizeEntityOutput,
+                func=normalize_drug,
+                tags=["normalize", "drug"],
+            ),
+            Tool(
+                name="normalize_via_ols",
+                description="Resolve disease/phenotype/pathway/cell/tissue terms via OLS4.",
+                input_schema=NormalizeEntityInput,
+                output_schema=NormalizeEntityOutput,
+                func=normalize_via_ols,
+                tags=["normalize", "ols"],
+            ),
+        ]
+    )

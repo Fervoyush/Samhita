@@ -201,13 +201,15 @@ async def test_end_to_end_mocked_pipeline(
     orch = LangGraphOrchestrator(llm=llm)
     result: KGResult = await orch.build("build a KG of drugs for atopic dermatitis")
 
-    assert result.state.status == "completed"
+    from samhita.core.schemas import RunStatus
+
+    assert result.state.status == RunStatus.COMPLETED
     assert result.state.fetched_documents >= 1
     assert result.state.extracted_entities >= 3
     assert result.state.extracted_edges >= 2
     assert len(result.entities) >= 3
     assert len(result.edges) >= 2
-    assert any("write:" in e for e in result.state.errors)
+    assert result.state.output_path is not None
 
     # The fallback CSV writer should have produced files in tmp_path
     assert (tmp_path / "nodes.csv").exists() or (tmp_path / "edges.csv").exists()

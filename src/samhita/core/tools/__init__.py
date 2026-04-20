@@ -28,11 +28,24 @@ class Tool:
 _REGISTRY: dict[str, Tool] = {}
 
 
-def register_tool(tool: Tool) -> Tool:
-    if tool.name in _REGISTRY:
-        raise ValueError(f"Tool {tool.name!r} is already registered")
+def register_tool(tool: Tool, *, replace: bool = False) -> Tool:
+    """Register a tool in the module-level registry.
+
+    Idempotent by default: a second call with the same ``name`` returns
+    the already-registered tool untouched. Pass ``replace=True`` to
+    overwrite, which is useful for tests that need to swap in mocks.
+    """
+    existing = _REGISTRY.get(tool.name)
+    if existing is not None and not replace:
+        return existing
     _REGISTRY[tool.name] = tool
     return tool
+
+
+def register_tools(tools: "list[Tool] | tuple[Tool, ...]") -> None:
+    """Bulk-register tools, skipping any already-registered names."""
+    for tool in tools:
+        register_tool(tool)
 
 
 def get_tool(name: str) -> Tool:

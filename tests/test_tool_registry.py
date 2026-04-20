@@ -40,18 +40,32 @@ def test_register_and_get_tool() -> None:
     assert "test" in fetched.tags
 
 
-def test_duplicate_registration_raises() -> None:
+def test_duplicate_registration_is_idempotent() -> None:
     clear_registry()
-    tool = Tool(
-        name="echo",
-        description="",
-        input_schema=_In,
-        output_schema=_Out,
-        func=_echo,
+    original = Tool(
+        name="echo", description="", input_schema=_In, output_schema=_Out, func=_echo
     )
-    register_tool(tool)
-    with pytest.raises(ValueError):
-        register_tool(tool)
+    register_tool(original)
+
+    # A second call with the same name returns the original and does NOT overwrite
+    replacement = Tool(
+        name="echo", description="new", input_schema=_In, output_schema=_Out, func=_echo
+    )
+    returned = register_tool(replacement)
+    assert returned is original
+    assert get_tool("echo").description == ""
+
+
+def test_replace_kwarg_overwrites() -> None:
+    clear_registry()
+    register_tool(
+        Tool(name="echo", description="v1", input_schema=_In, output_schema=_Out, func=_echo)
+    )
+    register_tool(
+        Tool(name="echo", description="v2", input_schema=_In, output_schema=_Out, func=_echo),
+        replace=True,
+    )
+    assert get_tool("echo").description == "v2"
 
 
 def test_unknown_tool_raises() -> None:

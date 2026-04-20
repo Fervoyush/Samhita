@@ -182,7 +182,7 @@ def _render_summary(result) -> None:  # noqa: ANN001
     state = result.state
 
     table = Table(title="Run summary", show_header=False, border_style="cyan")
-    table.add_row("Status", state.status)
+    table.add_row("Status", state.status.value)
     table.add_row("Duration (s)", f"{result.build_duration_seconds:.1f}")
     table.add_row("Fetched documents", str(state.fetched_documents))
     table.add_row("Extracted entities (raw)", str(state.extracted_entities))
@@ -197,29 +197,15 @@ def _render_summary(result) -> None:  # noqa: ANN001
 
     if state.errors:
         tail = state.errors[-6:]
-        _console.print("[bold]Log (last {}):[/bold]".format(len(tail)))
+        _console.print(f"[bold]Log (last {len(tail)}):[/bold]")
         for msg in tail:
             _console.print(f"  · {msg}")
 
-    output_path = _peek_output_path(state.errors)
-    if output_path:
+    if state.output_path:
         _console.print(
-            f"[green]Output:[/green] {output_path} "
+            f"[green]Output:[/green] {state.output_path} "
             f"(open nodes.csv / edges.csv / schema.json or the Biocypher import files)"
         )
-
-
-def _peek_output_path(errors: list[str]) -> str | None:
-    """Extract the Biocypher output dir from the write-node log line, if any."""
-    for line in reversed(errors):
-        if "write: wrote" in line and " to " in line:
-            # Format: "write: wrote N nodes / M edges to PATH via BACKEND"
-            try:
-                tail = line.split(" to ", 1)[1]
-                return tail.split(" via ", 1)[0]
-            except Exception:  # noqa: BLE001
-                return None
-    return None
 
 
 if __name__ == "__main__":

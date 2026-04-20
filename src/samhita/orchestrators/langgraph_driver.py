@@ -21,6 +21,7 @@ from samhita.core.fetchers import (
     fetch_drugbank_for_spec,
     fetch_opentargets_for_spec,
 )
+from samhita.core.fetchers._helpers import slugify
 from samhita.core.llm import LLMClient, Message
 from samhita.core.llm_clients import get_llm_client
 from samhita.core.prompts import PLANNER_SYSTEM_PROMPT
@@ -32,10 +33,11 @@ from samhita.core.schemas import (
     Identifier,
     KGResult,
     KGSpec,
-    ModelTier,
+    NamespaceName,
     Provenance,
     RelationType,
     RunState,
+    RunStatus,
     SectionType,
     SourceName,
     SourceType,
@@ -115,7 +117,7 @@ class LangGraphOrchestrator(AgentOrchestrator):
         state: _GraphState = {
             "nl_request": spec.original_request,
             "spec": spec,
-            "run_state": RunState(spec=spec, status="running"),
+            "run_state": RunState(spec=spec, status=RunStatus.RUNNING),
             "fetched_papers": [],
             "raw_entities": [],
             "raw_edges": [],
@@ -127,7 +129,7 @@ class LangGraphOrchestrator(AgentOrchestrator):
         }
         final_state = await self._run_graph(state)
         run_state: RunState = final_state["run_state"]
-        run_state.status = "completed"
+        run_state.status = RunStatus.COMPLETED
 
         return KGResult(
             spec=spec,
@@ -221,40 +223,31 @@ async def _fetch_node(state: _GraphState) -> _GraphState:
                 }
             )
 
-    # --- Structured sources (bypass extract + normalize) ---------------------
-    # OpenTargets / ChEMBL / DrugBank already ship canonical IDs. Their
-    # output flows as Entity / Edge directly; the extractor and normalizer
-    # only process literature-derived text.
-
-    if SourceName.OPENTARGETS in spec.sources:
+    # Structured sources ship canonical IDs, so their output bypasses
+    # extract + normalize and flows directly as Entity / Edge.
+    for source, fetcher in _STRUCTURED_FETCHERS.items():
+        if source not in spec.sources:
+            continue
         try:
-            ents, eds = await fetch_opentargets_for_spec(spec)
-            structured_entities.extend(ents)
-            structured_edges.extend(eds)
+            ents, eds = await fetcher(spec)
         except Exception as exc:  # noqa: BLE001
-            run_state.errors.append(f"fetch_opentargets: {exc}")
-
-    if SourceName.CHEMBL in spec.sources:
-        try:
-            ents, eds = await fetch_chembl_for_spec(spec)
-            structured_entities.extend(ents)
-            structured_edges.extend(eds)
-        except Exception as exc:  # noqa: BLE001
-            run_state.errors.append(f"fetch_chembl: {exc}")
-
-    if SourceName.DRUGBANK in spec.sources:
-        try:
-            ents, eds = await fetch_drugbank_for_spec(spec)
-            structured_entities.extend(ents)
-            structured_edges.extend(eds)
-        except Exception as exc:  # noqa: BLE001
-            run_state.errors.append(f"fetch_drugbank: {exc}")
+            run_state.errors.append(f"fetch_{source.value}: {exc}")
+            continue
+        structured_entities.extend(ents)
+        structured_edges.extend(eds)
 
     state["fetched_papers"] = papers
     state["structured_entities"] = structured_entities
     state["structured_edges"] = structured_edges
     run_state.fetched_documents = len(papers) + len(structured_entities)
     return state
+
+
+_STRUCTURED_FETCHERS: dict[SourceName, Any] = {
+    SourceName.OPENTARGETS: fetch_opentargets_for_spec,
+    SourceName.CHEMBL: fetch_chembl_for_spec,
+    SourceName.DRUGBANK: fetch_drugbank_for_spec,
+}
 
 
 async def _extract_node(state: _GraphState) -> _GraphState:
@@ -274,7 +267,7 @@ async def _extract_node(state: _GraphState) -> _GraphState:
             if not text or not text.strip():
                 continue
 
-            section_enum = _section_from_name(section_name)
+            section_enum = SectionType.from_alias(section_name)
             payload = ExtractFromTextInput(
                 text=text,
                 section=section_enum,
@@ -341,9 +334,8 @@ async def _normalize_node(state: _GraphState) -> _GraphState:
             NormalizeEntityInput(name=cand.name, entity_type=cand.entity_type)
         )
         if not isinstance(out, NormalizeEntityOutput) or out.primary_id is None:
-            # Fall back to a synthetic local identifier so the entity still
-            # flows through the pipeline — callers can prune later.
-            primary = Identifier(namespace="local", value=_slug(cand.name))
+            # Synthetic local: ID keeps the entity flowing; callers can prune.
+            primary = Identifier(namespace=NamespaceName.LOCAL, value=slugify(cand.name))
             run_state.errors.append(
                 f"normalize:{cand.name}:{cand.entity_type.value}: "
                 f"{(out.error if isinstance(out, NormalizeEntityOutput) else 'unknown')}"
@@ -459,16 +451,11 @@ async def _write_node(state: _GraphState) -> _GraphState:
             output_dir=f"biocypher-out/{spec.recipe.value}",
         )
     )
-    # Attach output location to the run state via errors log for visibility.
-    # (A proper `output_path` field on RunState is a small future change.)
     if getattr(out, "error", None):
         run_state.errors.append(f"write: {out.error}")
-    else:
-        run_state.errors.append(
-            f"write: wrote {getattr(out, 'nodes_written', 0)} nodes / "
-            f"{getattr(out, 'edges_written', 0)} edges to "
-            f"{getattr(out, 'output_dir', '?')} via {getattr(out, 'backend', '?')}"
-        )
+    output_dir = getattr(out, "output_dir", None)
+    if output_dir:
+        run_state.output_path = output_dir
     return state
 
 
@@ -519,24 +506,4 @@ def _build_pubmed_query(spec: KGSpec) -> str:
     return " OR ".join(terms)
 
 
-def _section_from_name(section_name: str) -> SectionType:
-    mapping = {
-        "abstract": SectionType.ABSTRACT,
-        "introduction": SectionType.INTRODUCTION,
-        "intro": SectionType.INTRODUCTION,
-        "methods": SectionType.METHODS,
-        "method": SectionType.METHODS,
-        "materials and methods": SectionType.METHODS,
-        "results": SectionType.RESULTS,
-        "result": SectionType.RESULTS,
-        "discussion": SectionType.DISCUSSION,
-        "conclusion": SectionType.DISCUSSION,
-    }
-    return mapping.get(section_name.lower(), SectionType.UNKNOWN)
-
-
-def _slug(name: str) -> str:
-    return "".join(c if c.isalnum() else "_" for c in name.lower()).strip("_")[:64]
-
-
-__all__ = ["LangGraphOrchestrator", "ModelTier"]
+__all__ = ["LangGraphOrchestrator"]

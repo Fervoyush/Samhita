@@ -93,6 +93,8 @@ def _no_sources_spec() -> KGSpec:
 
 
 async def test_execute_returns_kgresult() -> None:
+    from samhita.core.schemas import RunStatus
+
     spec = _no_sources_spec()
     fake: LLMClient = _FakeLLM(spec)
     from samhita.orchestrators.langgraph_driver import LangGraphOrchestrator
@@ -100,20 +102,22 @@ async def test_execute_returns_kgresult() -> None:
     orch = LangGraphOrchestrator(llm=fake)
     result = await orch.execute(spec)
     assert result.spec == spec
-    assert result.state.status == "completed"
+    assert result.state.status == RunStatus.COMPLETED
     assert result.state.fetched_documents == 0
     assert result.entities == []
     assert result.edges == []
 
 
 async def test_build_is_plan_plus_execute() -> None:
+    from samhita.core.schemas import RunStatus
+
     spec = _no_sources_spec()
     fake = _FakeLLM(spec)
     from samhita.orchestrators.langgraph_driver import LangGraphOrchestrator
 
     orch = LangGraphOrchestrator(llm=fake)
     result = await orch.build("build a KG of drugs for atopic dermatitis")
-    assert result.state.status == "completed"
+    assert result.state.status == RunStatus.COMPLETED
     assert len(fake.calls) == 1  # single planner call
 
 

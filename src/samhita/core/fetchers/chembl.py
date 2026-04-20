@@ -1,27 +1,24 @@
 """ChEMBL spec-aware fetcher.
 
 Turns drug seeds into ChEMBL REST calls and produces Samhita-typed
-Entity / Edge objects with Provenance. Supported seed:
-
-- ``drug``: molecule/search -> mechanism (mechanism_of_action + target)
-
-OpenTargets already covers target-/disease-centric queries at a higher
-level of curation, so this fetcher is deliberately drug-centric.
+Entity / Edge objects with Provenance. Drug-centric: OpenTargets
+already covers target- and disease-centric queries at a higher level
+of curation.
 """
 
 from __future__ import annotations
 
 from typing import Any
 
+from samhita.core.fetchers._helpers import make_edge, make_entity, merge_entity
 from samhita.core.schemas import (
     Edge,
     Entity,
     EntityType,
     Identifier,
     KGSpec,
-    Provenance,
+    NamespaceName,
     RelationType,
-    SectionType,
     SourceType,
 )
 from samhita.core.tools import get_tool
@@ -38,12 +35,12 @@ async def fetch_chembl_for_spec(spec: KGSpec) -> tuple[list[Entity], list[Edge]]
         chembl_id = await _resolve_drug_to_chembl_id(tool, drug_name)
         if not chembl_id:
             continue
-        drug_entity = _entity(
+        drug_entity = make_entity(
             EntityType.DRUG,
             drug_name,
-            Identifier(namespace="ChEMBL", value=chembl_id),
+            Identifier(namespace=NamespaceName.CHEMBL, value=chembl_id),
         )
-        _merge(entities, drug_entity)
+        merge_entity(entities, drug_entity)
 
         mech_out = await tool.func(
             ChEMBLQueryInput(
@@ -59,25 +56,19 @@ async def fetch_chembl_for_spec(spec: KGSpec) -> tuple[list[Entity], list[Edge]]
             if not target_id:
                 continue
             target_name = mech.get("mechanism_of_action") or target_id
-            target_entity = _entity(
+            target_entity = make_entity(
                 EntityType.PROTEIN,
                 target_name,
-                Identifier(namespace="ChEMBL", value=target_id),
+                Identifier(namespace=NamespaceName.CHEMBL, value=target_id),
             )
-            _merge(entities, target_entity)
-
-            action = str(mech.get("action_type") or "").lower()
-            relation = RelationType.TARGETS
-            if "inhibit" in action:
-                relation = RelationType.INHIBITS
-            elif "activ" in action or "agonist" in action:
-                relation = RelationType.ACTIVATES
+            merge_entity(entities, target_entity)
 
             edges.append(
-                _edge(
+                make_edge(
                     subject=drug_entity,
-                    relation=relation,
+                    relation=_relation_from_action(mech.get("action_type")),
                     object_=target_entity,
+                    source_type=SourceType.CHEMBL,
                     source_id=f"ChEMBL:mechanism:{chembl_id}",
                     confidence=0.9,
                     properties={
@@ -105,34 +96,10 @@ async def _resolve_drug_to_chembl_id(tool: Any, name: str) -> str | None:
     return molecules[0].get("molecule_chembl_id")
 
 
-def _entity(etype: EntityType, name: str, primary: Identifier) -> Entity:
-    return Entity(entity_type=etype, name=name, primary_id=primary)
-
-
-def _merge(store: dict[str, Entity], entity: Entity) -> None:
-    if entity.node_id not in store:
-        store[entity.node_id] = entity
-
-
-def _edge(
-    *,
-    subject: Entity,
-    relation: RelationType,
-    object_: Entity,
-    source_id: str,
-    confidence: float,
-    properties: dict[str, Any] | None = None,
-) -> Edge:
-    return Edge(
-        relation=relation,
-        subject_id=subject.node_id,
-        object_id=object_.node_id,
-        confidence=max(0.0, min(1.0, float(confidence))),
-        provenance=Provenance(
-            source_id=source_id,
-            source_type=SourceType.CHEMBL,
-            extracting_model=None,
-            section=SectionType.UNKNOWN,
-        ),
-        properties=properties or {},
-    )
+def _relation_from_action(action_type: str | None) -> RelationType:
+    action = str(action_type or "").lower()
+    if "inhibit" in action:
+        return RelationType.INHIBITS
+    if "activ" in action or "agonist" in action:
+        return RelationType.ACTIVATES
+    return RelationType.TARGETS
