@@ -10,14 +10,19 @@ from __future__ import annotations
 
 
 def bootstrap_tools() -> None:
-    """Register every built-in fetch/extract/normalize/write tool."""
-    # Fetch (implemented)
+    """Register every built-in fetch / normalize / write tool.
+
+    Extraction is LLM-dependent and therefore registered separately by
+    orchestrator drivers via :func:`register_extract_tools(llm)`; see
+    :mod:`samhita.core.tools.extract`.
+    """
     from samhita.core.tools.fetch import register_fetch_tools
+    from samhita.core.tools.normalize import register_normalize_tools
+    from samhita.core.tools.write import register_write_tools
 
     register_fetch_tools()
-
-    # Extract / normalize / write land in the next scaffolding steps.
-    # When they gain `register_*_tools` functions, import + call here.
+    register_normalize_tools()
+    register_write_tools()
 
 
 def bootstrap_llm_providers() -> None:
