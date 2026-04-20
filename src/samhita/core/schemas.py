@@ -249,13 +249,22 @@ class RunState(BaseModel):
     normalized_entities: int = 0
     flagged_conflicts: int = 0
     total_cost_usd: float = 0.0
-    cache_hit_rate: float = 0.0
+    total_input_tokens: int = 0
+    total_output_tokens: int = 0
+    cached_input_tokens: int = 0
     errors: list[str] = Field(default_factory=list)
     status: RunStatus = RunStatus.PENDING
     output_path: str | None = Field(
         default=None,
         description="filesystem path of the written KG artifact (set by the write node)",
     )
+
+    @property
+    def cache_hit_rate(self) -> float:
+        """Fraction of input tokens that hit the provider's prompt cache."""
+        if self.total_input_tokens <= 0:
+            return 0.0
+        return self.cached_input_tokens / self.total_input_tokens
 
 
 class KGResult(BaseModel):

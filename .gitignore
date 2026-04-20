@@ -94,3 +94,6 @@ graphify-out/
 graph.html
 graph.json
 GRAPH_REPORT.md
+
+# Benchmark reports (regenerated on demand)
+benchmarks/

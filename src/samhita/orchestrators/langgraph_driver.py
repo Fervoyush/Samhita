@@ -325,6 +325,9 @@ async def _extract_node(state: _GraphState) -> _GraphState:
             continue
 
         run_state.total_cost_usd += out.cost_usd
+        run_state.total_input_tokens += out.input_tokens
+        run_state.total_output_tokens += out.output_tokens
+        run_state.cached_input_tokens += out.cached_tokens
         if out.error:
             run_state.errors.append(f"extract:{source_id}:{section_name}: {out.error}")
             continue

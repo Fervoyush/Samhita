@@ -6,6 +6,8 @@ import asyncio
 import json
 import os
 import sys
+from collections.abc import Iterable
+from datetime import datetime, timezone
 from pathlib import Path
 
 import typer
@@ -96,6 +98,64 @@ def plan(
 
 
 @app.command()
+def benchmark(
+    request: str = typer.Argument(..., help="Natural-language KG build request."),
+    providers: list[str] = typer.Option(
+        ["anthropic:claude-sonnet-4-6", "moonshot:kimi-k2.5"],
+        "--provider",
+        "-p",
+        help=(
+            "Repeat: provider:model pairs. "
+            "Example: -p anthropic:claude-sonnet-4-6 -p moonshot:kimi-k2.5"
+        ),
+    ),
+    max_papers: int = typer.Option(
+        5,
+        "--max-papers",
+        help="Cap literature-source paper count (-1 = let the planner decide).",
+    ),
+    output_dir: str = typer.Option(
+        "benchmarks",
+        "--output-dir",
+        "-o",
+        help="Where to write the benchmark JSON report.",
+    ),
+) -> None:
+    """Run the same KGSpec through N providers and compare."""
+    from samhita.benchmark import (
+        parse_provider_spec,
+        run_benchmark,
+        save_report,
+    )
+
+    try:
+        configs = [parse_provider_spec(p) for p in providers]
+    except ValueError as exc:
+        _console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(code=1) from exc
+
+    _check_secrets_for_providers(c.provider for c in configs)
+    _load_drivers()
+
+    _console.print(
+        f"[cyan]Benchmarking[/cyan] {len(configs)} providers on "
+        f"[bold]{request!r}[/bold] with max_papers={max_papers}"
+    )
+
+    cap = None if max_papers <= 0 else max_papers
+    report = asyncio.run(
+        run_benchmark(request=request, configs=configs, max_papers=cap)
+    )
+
+    _render_benchmark(report)
+
+    ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    out = Path(output_dir) / f"benchmark-{ts}.json"
+    save_report(report, out)
+    _console.print(f"[green]Report:[/green] {out.resolve()}")
+
+
+@app.command()
 def build(
     request: str = typer.Argument(..., help="Natural-language KG build request."),
     framework: str = typer.Option(
@@ -169,13 +229,94 @@ def _build_orchestrator(framework: str, provider: str, model: str):  # noqa: ANN
         return get_orchestrator(framework)
 
 
+_PROVIDER_ENV_KEYS = {
+    "anthropic": "ANTHROPIC_API_KEY",
+    "moonshot": "MOONSHOT_API_KEY",
+    "openai": "OPENAI_API_KEY",
+}
+
+
 def _check_secrets(provider: str) -> None:
-    if provider == "anthropic" and not os.getenv("ANTHROPIC_API_KEY"):
+    key = _PROVIDER_ENV_KEYS.get(provider)
+    if key and not os.getenv(key):
         _console.print(
-            "[red]ANTHROPIC_API_KEY is not set.[/red] "
-            "Export it before running plan / build, or pass --provider to use a different LLM."
+            f"[red]{key} is not set.[/red] "
+            "Export it before running plan / build / benchmark, "
+            "or pass --provider to use a different LLM."
         )
         raise typer.Exit(code=2)
+
+
+def _check_secrets_for_providers(providers: Iterable[str]) -> None:
+    missing: list[str] = []
+    for provider in providers:
+        key = _PROVIDER_ENV_KEYS.get(provider)
+        if key and not os.getenv(key):
+            missing.append(key)
+    if missing:
+        _console.print(
+            f"[red]Missing API keys: {', '.join(sorted(set(missing)))}.[/red] "
+            "Export them before running the benchmark."
+        )
+        raise typer.Exit(code=2)
+
+
+def _render_benchmark(report) -> None:  # noqa: ANN001
+    table = Table(title="Benchmark — per-provider metrics", border_style="cyan")
+    table.add_column("Provider:Model", style="bold")
+    table.add_column("Status")
+    table.add_column("Duration (s)", justify="right")
+    table.add_column("Cost (USD)", justify="right")
+    table.add_column("In / Out / Cached", justify="right")
+    table.add_column("Cache %", justify="right")
+    table.add_column("Entities", justify="right")
+    table.add_column("Edges", justify="right")
+    for run in report.runs:
+        table.add_row(
+            run.label,
+            run.status,
+            f"{run.duration_s:.1f}",
+            f"${run.total_cost_usd:.4f}",
+            f"{run.input_tokens:,} / {run.output_tokens:,} / {run.cached_input_tokens:,}",
+            f"{run.cache_hit_rate:.0%}",
+            str(run.entity_count),
+            str(run.edge_count),
+        )
+    _console.print(table)
+
+    if report.overlaps:
+        overlap_table = Table(
+            title="Pairwise output overlap (Jaccard)", border_style="magenta"
+        )
+        overlap_table.add_column("A")
+        overlap_table.add_column("B")
+        overlap_table.add_column("Entities J", justify="right")
+        overlap_table.add_column("Edges J", justify="right")
+        overlap_table.add_column("Shared ents", justify="right")
+        overlap_table.add_column("Shared edges", justify="right")
+        for o in report.overlaps:
+            overlap_table.add_row(
+                o.a,
+                o.b,
+                f"{o.entity_jaccard:.2f}",
+                f"{o.edge_jaccard:.2f}",
+                f"{o.shared_entities}/{o.total_entities}",
+                f"{o.shared_edges}/{o.total_edges}",
+            )
+        _console.print(overlap_table)
+
+    cost_ratios = [
+        run for run in report.runs if run.status != "failed" and run.total_cost_usd > 0
+    ]
+    if len(cost_ratios) >= 2:
+        cheapest = min(cost_ratios, key=lambda r: r.total_cost_usd)
+        costliest = max(cost_ratios, key=lambda r: r.total_cost_usd)
+        if costliest.total_cost_usd > 0 and cheapest is not costliest:
+            ratio = costliest.total_cost_usd / cheapest.total_cost_usd
+            _console.print(
+                f"[green]Cheapest:[/green] {cheapest.label} "
+                f"([bold]{ratio:.1f}×[/bold] cheaper than {costliest.label})"
+            )
 
 
 def _render_summary(result) -> None:  # noqa: ANN001
