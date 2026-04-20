@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import csv
 import json
+import os
 from pathlib import Path
 from typing import Any
 
@@ -44,22 +45,21 @@ class BiocypherWriteOutput(BaseModel):
 
 
 async def write_biocypher(payload: BiocypherWriteInput) -> BiocypherWriteOutput:
-    """Write nodes + edges to disk, preferring Biocypher when available."""
+    """Write nodes + edges to disk.
+
+    Prefers Biocypher *only* when a schema config is available — Biocypher
+    logs errors but does not raise when schema types are missing, so
+    running it unconfigured leaves silently-empty output. The CSV fallback
+    is deterministic and always produces inspectable output.
+    """
     out_dir = Path(payload.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    # Biocypher path (preferred) --------------------------------------------
-    try:
-        import biocypher  # type: ignore[import-not-found]
-    except ImportError:
-        biocypher = None  # type: ignore[assignment]
-
-    if biocypher is not None:
+    schema_path = _resolve_biocypher_schema()
+    if schema_path is not None:
         try:
-            return _write_via_biocypher(payload, out_dir)
-        except Exception as exc:  # noqa: BLE001 — fall through to CSV path
-            # Don't silently swallow — record and continue with CSV so a run
-            # always produces something inspectable.
+            return _write_via_biocypher(payload, out_dir, schema_path)
+        except Exception as exc:  # noqa: BLE001
             csv_out = _write_via_csv(payload, out_dir)
             csv_out.error = f"biocypher path failed ({exc}); wrote CSV fallback"
             return csv_out
@@ -67,13 +67,43 @@ async def write_biocypher(payload: BiocypherWriteInput) -> BiocypherWriteOutput:
     return _write_via_csv(payload, out_dir)
 
 
+def _resolve_biocypher_schema() -> Path | None:
+    """Return a schema config path if Biocypher + a schema are both available.
+
+    Precedence:
+      1. ``$SAMHITA_BIOCYPHER_SCHEMA`` env var
+      2. ``config/biocypher_schema_config.yaml`` in the current working dir
+
+    Returns ``None`` (forcing the CSV fallback) if Biocypher is not
+    installed or no schema config is found. Running Biocypher without a
+    schema config yields silent-error output, so we refuse to go there.
+    """
+    try:
+        import biocypher  # type: ignore[import-not-found]  # noqa: F401
+    except ImportError:
+        return None
+
+    env = os.getenv("SAMHITA_BIOCYPHER_SCHEMA", "").strip()
+    if env and Path(env).exists():
+        return Path(env)
+
+    default = Path.cwd() / "config" / "biocypher_schema_config.yaml"
+    if default.exists():
+        return default
+
+    return None
+
+
 def _write_via_biocypher(
-    payload: BiocypherWriteInput, out_dir: Path
+    payload: BiocypherWriteInput, out_dir: Path, schema_path: Path
 ) -> BiocypherWriteOutput:
     """Use Biocypher to emit Neo4j-admin-import-compatible files."""
     from biocypher import BioCypher  # type: ignore[import-not-found]
 
-    bc = BioCypher(output_directory=str(out_dir))
+    bc = BioCypher(
+        output_directory=str(out_dir),
+        schema_config_path=str(schema_path),
+    )
 
     node_tuples: list[tuple[str, str, dict[str, Any]]] = []
     for entity in payload.entities:

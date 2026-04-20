@@ -75,20 +75,40 @@ async def test_plan_returns_kgspec_and_passes_nl_request(fake_kgspec: KGSpec) ->
     assert spec.original_request == "build a KG of drugs for atopic dermatitis"
 
 
-async def test_execute_returns_kgresult(fake_kgspec: KGSpec) -> None:
-    fake: LLMClient = _FakeLLM(fake_kgspec)
+def _no_sources_spec() -> KGSpec:
+    """Spec with no sources — avoids real network calls in unit tests.
+
+    Full-pipeline coverage lives in test_langgraph_end_to_end.py, which
+    mocks fetch tools; the tests here only verify plumbing + return shape.
+    """
+    return KGSpec(
+        recipe=RecipeName.DRUG_TARGET_DISEASE,
+        seeds={"disease": ["atopic dermatitis"]},
+        sources=[],
+        entity_types=[EntityType.DRUG, EntityType.GENE, EntityType.DISEASE],
+        relation_types=[RelationType.TARGETS, RelationType.TREATS],
+        max_papers=1,
+        original_request="build a KG of drugs for atopic dermatitis",
+    )
+
+
+async def test_execute_returns_kgresult() -> None:
+    spec = _no_sources_spec()
+    fake: LLMClient = _FakeLLM(spec)
     from samhita.orchestrators.langgraph_driver import LangGraphOrchestrator
 
     orch = LangGraphOrchestrator(llm=fake)
-    result = await orch.execute(fake_kgspec)
-    assert result.spec == fake_kgspec
+    result = await orch.execute(spec)
+    assert result.spec == spec
     assert result.state.status == "completed"
-    # Nodes are currently stubs — they record their stub status via errors
-    assert any("stub" in e for e in result.state.errors)
+    assert result.state.fetched_documents == 0
+    assert result.entities == []
+    assert result.edges == []
 
 
-async def test_build_is_plan_plus_execute(fake_kgspec: KGSpec) -> None:
-    fake = _FakeLLM(fake_kgspec)
+async def test_build_is_plan_plus_execute() -> None:
+    spec = _no_sources_spec()
+    fake = _FakeLLM(spec)
     from samhita.orchestrators.langgraph_driver import LangGraphOrchestrator
 
     orch = LangGraphOrchestrator(llm=fake)
