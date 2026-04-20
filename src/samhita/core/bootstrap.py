@@ -39,6 +39,7 @@ def bootstrap_llm_providers(*, force: bool = False) -> None:
     if _BOOTSTRAPPED_LLM and not force:
         return
     import samhita.core.llm_clients.anthropic  # noqa: F401
+    import samhita.core.llm_clients.kimi  # noqa: F401
     _BOOTSTRAPPED_LLM = True
 
 
