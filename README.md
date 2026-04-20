@@ -92,6 +92,12 @@ Samhita composes existing ecosystem components rather than competing with them. 
 
 *Coming soon — project scaffolding in progress.*
 
+## Development
+
+See [DEVELOPMENT.md](./DEVELOPMENT.md) for local setup, test commands,
+and the graphify-based codebase map that keeps AI coding assistants
+cheap to run.
+
 ## License
 
 Apache 2.0.

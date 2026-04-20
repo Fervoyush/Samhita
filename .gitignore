@@ -88,3 +88,9 @@ prompt_logs/
 .mypy_cache/
 .ruff_cache/
 .pytype/
+
+# graphify (per-developer codebase map — not source of truth)
+graphify-out/
+graph.html
+graph.json
+GRAPH_REPORT.md
