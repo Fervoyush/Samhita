@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+from functools import lru_cache
 from typing import Any
 
 from pydantic import BaseModel
@@ -16,6 +17,20 @@ from pydantic import BaseModel
 from samhita.core.llm import LLMClient, LLMResponse, Message
 from samhita.core.llm_clients import register_llm_factory
 from samhita.core.schemas import ModelTier
+
+
+@lru_cache(maxsize=64)
+def _tool_from_schema(schema: type[BaseModel]) -> dict[str, Any]:
+    """Convert a Pydantic schema to an Anthropic tool definition.
+
+    Cached because ``model_json_schema()`` is nontrivial and the same
+    schema is used on every structured-output call.
+    """
+    return {
+        "name": "emit_structured",
+        "description": f"Return a validated {schema.__name__} payload.",
+        "input_schema": schema.model_json_schema(),
+    }
 
 # Per 1M tokens (USD). Values are illustrative defaults and overridable
 # via constructor — update when Anthropic publishes new prices.
@@ -64,7 +79,7 @@ class AnthropicClient:
         schema: type[BaseModel] | None = None,
         temperature: float = 0.0,
         max_tokens: int = 4096,
-        cache_hint: str | None = None,  # noqa: ARG002 — not used by Anthropic-side cache
+        cache_hint: str | None = None,  # noqa: ARG002 — Anthropic caches by prefix, not key
     ) -> LLMResponse:
         client = self._sdk()
 
@@ -82,18 +97,25 @@ class AnthropicClient:
             "temperature": temperature,
             "messages": chat_messages,
         }
+        # Send system as a content block with cache_control so the prefix is
+        # reused across calls in the same 5-minute window. On Samhita's
+        # extraction workload (same system prompt across N papers × sections)
+        # this cuts input-token cost by roughly an order of magnitude.
         if system_text is not None:
-            kwargs["system"] = system_text
-
-        if schema is not None:
-            schema_dict = schema.model_json_schema()
-            kwargs["tools"] = [
+            kwargs["system"] = [
                 {
-                    "name": "emit_structured",
-                    "description": f"Return a validated {schema.__name__} payload.",
-                    "input_schema": schema_dict,
+                    "type": "text",
+                    "text": system_text,
+                    "cache_control": {"type": "ephemeral"},
                 }
             ]
+
+        if schema is not None:
+            tool_def = dict(_tool_from_schema(schema))
+            # Also cache the tool (including its JSON schema) — identical
+            # across every structured-output call.
+            tool_def["cache_control"] = {"type": "ephemeral"}
+            kwargs["tools"] = [tool_def]
             kwargs["tool_choice"] = {"type": "tool", "name": "emit_structured"}
 
         response = await client.messages.create(**kwargs)

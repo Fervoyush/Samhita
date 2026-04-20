@@ -67,5 +67,13 @@ def all_tools() -> dict[str, Tool]:
 
 
 def clear_registry() -> None:
-    """Test helper — do not call from production code."""
+    """Test helper — clears the tool registry AND the bootstrap guard flags.
+
+    Do not call from production code. Delayed import avoids circularity:
+    :mod:`samhita.core.bootstrap` imports tool modules that live under
+    ``core.tools``.
+    """
     _REGISTRY.clear()
+    from samhita.core.bootstrap import _reset_bootstrap_flags
+
+    _reset_bootstrap_flags()
