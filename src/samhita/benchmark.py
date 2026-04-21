@@ -103,6 +103,7 @@ async def run_benchmark(
     *,
     max_papers: int | None = None,
     plan_with: BenchmarkConfig | None = None,
+    parallel: bool = False,
 ) -> BenchmarkReport:
     """Plan once, execute once per config, aggregate metrics.
 
@@ -110,6 +111,12 @@ async def run_benchmark(
     the first entry in ``configs`` does it. Every config then executes
     the same :class:`KGSpec` so output deltas reflect the LLM alone,
     not the planner.
+
+    Executions run **sequentially** by default — the upstream fetch
+    tools (NCBI E-utilities in particular) rate-limit aggressively,
+    and concurrent provider runs compete for that quota and distort
+    results. Pass ``parallel=True`` only for speed-testing on corpora
+    that don't hit rate-limited providers.
     """
     if not configs:
         raise ValueError("benchmark requires at least one (provider, model)")
@@ -121,12 +128,19 @@ async def run_benchmark(
     if max_papers is not None and max_papers > 0:
         spec = spec.model_copy(update={"max_papers": max_papers})
 
-    # Executes are independent: different providers, different clients,
-    # no shared state — so run them concurrently.
-    results = await asyncio.gather(
-        *(_execute_one(cfg, spec) for cfg in configs),
-        return_exceptions=True,
-    )
+    results: list[KGResult | Exception]
+    if parallel:
+        results = await asyncio.gather(
+            *(_execute_one(cfg, spec) for cfg in configs),
+            return_exceptions=True,
+        )
+    else:
+        results = []
+        for cfg in configs:
+            try:
+                results.append(await _execute_one(cfg, spec))
+            except Exception as exc:  # noqa: BLE001
+                results.append(exc)
 
     runs: list[RunMetrics] = []
     succeeded: list[tuple[BenchmarkConfig, KGResult]] = []

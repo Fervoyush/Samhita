@@ -50,7 +50,7 @@ from samhita.core.tools.extract import (
     ExtractFromTextInput,
     ExtractFromTextOutput,
     ExtractionCandidate,
-    register_extract_tools,
+    make_extract_from_text_tool,
 )
 from samhita.core.tools.fetch import (
     PMCFetchInput,
@@ -78,6 +78,10 @@ class _GraphState(TypedDict, total=False):
     normalized_entities: dict[str, Entity]  # name -> Entity
     final_edges: list[Edge]
     started_at: float
+    # Per-orchestrator extract tool — carried in state rather than
+    # looked up from the global registry so two orchestrators with
+    # different LLMs can run concurrently without stomping each other.
+    extract_tool: Any
 
 
 @register_orchestrator("langgraph")
@@ -93,7 +97,8 @@ class LangGraphOrchestrator(AgentOrchestrator):
         bootstrap_tools()
         bootstrap_llm_providers()
         self._llm: LLMClient = llm or get_llm_client(llm_provider, model=llm_model)
-        register_extract_tools(self._llm)
+        # Per-instance extract tool — see _GraphState for why.
+        self._extract_tool = make_extract_from_text_tool(self._llm)
         self._graph = self._build_graph()
 
     # ------------------------------------------------------------------ plan
@@ -128,6 +133,7 @@ class LangGraphOrchestrator(AgentOrchestrator):
             "normalized_entities": {},
             "final_edges": [],
             "started_at": time.monotonic(),
+            "extract_tool": self._extract_tool,
         }
         final_state = await self._run_graph(state)
         run_state: RunState = final_state["run_state"]
@@ -199,7 +205,15 @@ async def _fetch_node(state: _GraphState) -> _GraphState:
         search_out = await get_tool("search_pubmed").func(
             PubMedSearchInput(query=query, max_results=min(spec.max_papers, 50))
         )
+        search_error = getattr(search_out, "error", None)
         pmids = getattr(search_out, "pmids", []) or []
+
+        if search_error:
+            run_state.errors.append(f"search_pubmed: {search_error}")
+        elif not pmids:
+            run_state.errors.append(
+                f"search_pubmed: 0 hits for query {query!r} (check rate limits / term)"
+            )
 
         include_pmc = SourceName.PUBMED_CENTRAL in spec.sources
         fetched_papers = await _bounded_gather(
@@ -280,7 +294,10 @@ _STRUCTURED_FETCHERS: dict[SourceName, Any] = {
 async def _extract_node(state: _GraphState) -> _GraphState:
     spec: KGSpec = state["spec"]
     run_state: RunState = state["run_state"]
-    extract_tool = get_tool("extract_from_text")
+    # Per-instance extract tool stored by the orchestrator; fall back to
+    # the global registry only if absent (e.g. custom drivers that pre-date
+    # the per-instance pattern).
+    extract_tool = state.get("extract_tool") or get_tool("extract_from_text")
 
     raw_entities: list[tuple[ExtractionCandidate, Provenance]] = []
     raw_edges: list[tuple[ExtractedEdge, Provenance]] = []

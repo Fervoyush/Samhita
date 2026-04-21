@@ -94,18 +94,25 @@ class KimiClient:
         openai_messages = [
             {"role": m.role, "content": m.content} for m in messages
         ]
+        # The kimi-k2.* models reject any temperature other than 1; honour the
+        # constraint transparently rather than force every caller to special-case
+        # per-provider.
+        effective_temperature = 1.0 if self.model.startswith("kimi-k2") else temperature
         kwargs: dict[str, Any] = {
             "model": self.model,
             "messages": openai_messages,
-            "temperature": temperature,
+            "temperature": effective_temperature,
             "max_tokens": max_tokens,
         }
         if schema is not None:
             kwargs["tools"] = [_tool_from_schema(schema)]
-            kwargs["tool_choice"] = {
-                "type": "function",
-                "function": {"name": "emit_structured"},
-            }
+            # kimi-k2 family is thinking-always and rejects forced tool_choice;
+            # let the model decide and fall back to parsing JSON text below.
+            kwargs["tool_choice"] = (
+                "auto"
+                if self.model.startswith("kimi-k2")
+                else {"type": "function", "function": {"name": "emit_structured"}}
+            )
 
         response = await client.chat.completions.create(**kwargs)
 
@@ -116,12 +123,7 @@ class KimiClient:
             msg = choice.message
             content_text = getattr(msg, "content", "") or ""
             if schema is not None:
-                tool_calls = getattr(msg, "tool_calls", None) or []
-                if tool_calls:
-                    raw_args = tool_calls[0].function.arguments
-                    if isinstance(raw_args, str):
-                        raw_args = json.loads(raw_args)
-                    parsed = schema.model_validate(raw_args)
+                parsed = _parse_structured(msg, schema, content_text)
 
         usage = getattr(response, "usage", None)
         input_tokens = int(getattr(usage, "prompt_tokens", 0) or 0)
@@ -150,6 +152,84 @@ class KimiClient:
             + cached_tokens * cached_rate / 1_000_000
             + output_tokens * output_rate / 1_000_000
         )
+
+
+def _parse_structured(
+    msg: Any, schema: type[BaseModel], content_text: str
+) -> BaseModel | None:
+    """Extract a validated schema instance from a chat-completion message.
+
+    Order of attempts:
+      1. Native OpenAI-style ``tool_calls`` (the happy path for non-thinking
+         models that obey forced tool_choice).
+      2. Raw JSON embedded in the text content — the fallback for thinking
+         models which rejected the forced tool_choice and answered with a
+         JSON blob instead.
+    """
+    tool_calls = getattr(msg, "tool_calls", None) or []
+    if tool_calls:
+        raw_args = tool_calls[0].function.arguments
+        if isinstance(raw_args, str):
+            raw_args = json.loads(raw_args)
+        return schema.model_validate(raw_args)
+
+    if not content_text:
+        return None
+
+    payload = _extract_json_object(content_text)
+    if payload is None:
+        return None
+    try:
+        return schema.model_validate(payload)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _extract_json_object(text: str) -> dict[str, Any] | None:
+    """Pull a top-level JSON object out of free-form text.
+
+    Handles the three shapes thinking models typically emit:
+      - pure JSON
+      - JSON inside a ```json fenced block
+      - JSON after some leading prose
+    """
+    stripped = text.strip()
+    # Strip markdown fences if present.
+    if stripped.startswith("```"):
+        fence_end = stripped.find("\n")
+        if fence_end != -1:
+            stripped = stripped[fence_end + 1 :]
+        if stripped.endswith("```"):
+            stripped = stripped[: -len("```")]
+        stripped = stripped.strip()
+
+    try:
+        value = json.loads(stripped)
+        if isinstance(value, dict):
+            return value
+    except Exception:  # noqa: BLE001
+        pass
+
+    # Last resort: find the first balanced { ... } in the text.
+    start = stripped.find("{")
+    if start == -1:
+        return None
+    depth = 0
+    for idx in range(start, len(stripped)):
+        ch = stripped[idx]
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                candidate = stripped[start : idx + 1]
+                try:
+                    value = json.loads(candidate)
+                    if isinstance(value, dict):
+                        return value
+                except Exception:  # noqa: BLE001
+                    return None
+    return None
 
 
 def _read_cached_tokens(usage: Any) -> int:

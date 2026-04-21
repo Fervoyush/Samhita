@@ -178,5 +178,12 @@ def make_extract_from_text_tool(llm: LLMClient) -> Tool:
 
 
 def register_extract_tools(llm: LLMClient) -> None:
-    """Register the LLM-bound extraction tool (idempotent)."""
+    """Register the LLM-bound extraction tool (idempotent).
+
+    Kept for back-compat with callers that still rely on the global
+    registry. New orchestrators should carry a per-instance Tool built
+    via :func:`make_extract_from_text_tool` instead — this avoids the
+    race where two orchestrators with different LLMs share one
+    registered tool.
+    """
     register_tool(make_extract_from_text_tool(llm))
